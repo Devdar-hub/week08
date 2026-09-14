@@ -11,5 +11,5 @@ resource "azurerm_container_registry" "acr" {
         {
             Environment = var.environment
         }
-    )
+    )  
 }
