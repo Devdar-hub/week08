@@ -115,7 +115,8 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-
+from prometheus_fastapi_instrumentator import Instrumentator
+Instrumentator().instrument(app).expose(app)
 app.include_router(auth.router)
 app.include_router(users.router)
 

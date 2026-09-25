@@ -1,0 +1,41 @@
+# monitoring/service-monitor.yaml
+# Tells Prometheus (via the Prometheus Operator installed by kube-prometheus-stack)
+# to scrape metrics from your FastAPI application services.
+#
+# Requires your FastAPI services to expose a /metrics endpoint. If not already
+# present, add the `prometheus-fastapi-instrumentator` package:
+#   pip install prometheus-fastapi-instrumentator
+# and in each service's main.py:
+#   from prometheus_fastapi_instrumentator import Instrumentator
+#   Instrumentator().instrument(app).expose(app)
+
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: koalatech-services
+  namespace: monitoring
+  labels:
+    release: monitoring
+spec:
+  namespaceSelector:
+    matchNames:
+      - production
+      - staging
+  selector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values:
+          - user-service
+          - student-service
+          - lecturer-service
+          - course-service
+          - enrollment-service
+  endpoints:
+    - targetPort: 8000
+      path: /metrics
+      interval: 15s
+# This ServiceMonitor matches the existing Kubernetes Service labels:
+#   app: user-service, app: student-service, app: lecturer-service,
+#   app: course-service, and app: enrollment-service.
+# It scrapes both production and staging namespaces on /metrics.
