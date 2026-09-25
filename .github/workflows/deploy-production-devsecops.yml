@@ -14,6 +14,7 @@ on:
       - main
 
 env:
+  IMAGE_SHA: ${{ github.event.inputs.image_sha || github.sha }}
   TF_WORKING_DIR: terraform
   SERVICES: "user-service student-service lecturer-service course-service enrollment-service frontend"
 
@@ -67,6 +68,26 @@ jobs:
       - name: Terraform Validate
         run: terraform validate
 
+      - name: Import existing AKS diagnostic setting
+        run: |
+          AKS_ID=$(az aks show \
+            --resource-group ${{ vars.AKS_RESOURCE_GROUP }} \
+            --name ${{ vars.AKS_CLUSTER_NAME }} \
+            --query id \
+            -o tsv 2>/dev/null || true)
+
+          if [ -n "$AKS_ID" ]; then
+            terraform import \
+              azurerm_monitor_diagnostic_setting.aks_diagnostics \
+              "$AKS_ID|aks-diagnostics" \
+              || true
+          fi
+        env:
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+
       - name: Terraform Plan
         id: plan
         run: terraform plan -input=false -no-color -out=tfplan
@@ -104,7 +125,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.image_sha }}
+          ref: ${{ env.IMAGE_SHA }}
 
       - name: Azure login
         uses: azure/login@v2
@@ -116,7 +137,7 @@ jobs:
 
       - name: Build image
         run: |
-          docker build -t ${{ vars.ACR_NAME }}.azurecr.io/${{ matrix.service }}:${{ github.event.inputs.image_sha }} \
+          docker build -t ${{ vars.ACR_NAME }}.azurecr.io/${{ matrix.service }}:${{ env.IMAGE_SHA }} \
             ./${{ matrix.service }}
 
       # --------------------------------------------------------------
@@ -130,7 +151,7 @@ jobs:
         uses: docker/scout-action@v1
         with:
           command: cves
-          image: ${{ vars.ACR_NAME }}.azurecr.io/${{ matrix.service }}:${{ github.event.inputs.image_sha }}
+          image: ${{ vars.ACR_NAME }}.azurecr.io/${{ matrix.service }}:${{ env.IMAGE_SHA }}
           only-severities: critical,high
           exit-code: false           # set true once you've remediated known issues, to enforce the gate
           write-comment: false
@@ -140,7 +161,7 @@ jobs:
         uses: docker/scout-action@v1
         with:
           command: recommendations
-          image: ${{ vars.ACR_NAME }}.azurecr.io/${{ matrix.service }}:${{ github.event.inputs.image_sha }}
+          image: ${{ vars.ACR_NAME }}.azurecr.io/${{ matrix.service }}:${{ env.IMAGE_SHA }}
           summary: true
 
       - name: Save Docker Scout report as evidence
@@ -156,7 +177,7 @@ jobs:
           path: scout-reports/
 
       - name: Push image (post security gate)
-        run: docker push ${{ vars.ACR_NAME }}.azurecr.io/${{ matrix.service }}:${{ github.event.inputs.image_sha }}
+        run: docker push ${{ vars.ACR_NAME }}.azurecr.io/${{ matrix.service }}:${{ env.IMAGE_SHA }}
 
   # ------------------------------------------------------------------
   # 4. APPLICATION DEPLOYMENT (existing step, kept as-is)
@@ -185,7 +206,7 @@ jobs:
       - name: Deploy manifests
         run: |
           for svc in ${{ env.SERVICES }}; do
-            kubectl set image deployment/$svc $svc=${{ vars.ACR_NAME }}.azurecr.io/$svc:${{ github.event.inputs.image_sha }}
+            kubectl set image deployment/$svc $svc=${{ vars.ACR_NAME }}.azurecr.io/$svc:${{ env.IMAGE_SHA }}
           done
           kubectl rollout status deployment/user-service
           kubectl rollout status deployment/frontend
