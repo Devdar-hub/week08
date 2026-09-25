@@ -21,11 +21,11 @@ jobs:
   # ------------------------------------------------------------------
   # 1. INFRASTRUCTURE AS CODE
   #    Runs first: any infra drift or new resources (e.g. a monitoring
-  #    namespace, a new Log Analytics workspace) can be reviewed before the
+  #    namespace, a new Log Analytics workspace) must exist before the
   #    app is deployed or monitoring is installed.
   # ------------------------------------------------------------------
   terraform:
-    name: Terraform Validate & Plan
+    name: Terraform Plan & Apply
     runs-on: ubuntu-latest
     environment: production
     outputs:
@@ -38,7 +38,7 @@ jobs:
       TF_VAR_aks_dns_prefix: ${{ vars.AKS_DNS_PREFIX || 'dar-dns-v1' }}
       TF_VAR_aks_node_count: 3
       TF_VAR_aks_node_vm_size: Standard_D2s_v3
-      TF_VAR_environment: production
+      TF_VAR_environment: production  
     defaults:
       run:
         working-directory: ${{ env.TF_WORKING_DIR }}
@@ -82,8 +82,7 @@ jobs:
           name: terraform-plan-output
           path: ${{ env.TF_WORKING_DIR }}/tfplan
 
-      - name: Terraform Apply (optional)
-        if: ${{ vars.TERRAFORM_APPLY == 'true' }}
+      - name: Terraform Apply
         run: terraform apply -input=false -auto-approve tfplan
         env:
           ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
