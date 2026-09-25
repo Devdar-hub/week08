@@ -9,11 +9,9 @@ name: Deploy to Production (Terraform + Security + Monitoring)
 # existing production promotion pattern used in this project.
 
 on:
-  workflow_dispatch:
-    inputs:
-      image_sha:
-        description: "Staging-validated commit SHA to promote to production"
-        required: true
+  push:
+    branches:
+      - main
 
 env:
   TF_WORKING_DIR: terraform
