@@ -5,11 +5,11 @@
 # Kubernetes namespace that the Prometheus/Grafana Helm release deploys into.
 #
 # Assumes your existing Terraform config already defines:
-#   - azurerm_resource_group.main          (dar-week08-v1-rg / Australia East)
-#   - azurerm_kubernetes_cluster.aks       (k8dar81v1)
+#   - azurerm_resource_group.rg          (dar-week08-v1-rg / Australia East)
+#   - azurerm_kubernetes_cluster.aks
 #   - variable "tags" (as set in your terraform.tfvars)
 #   - a configured azurerm and kubernetes provider
-# If your resource labels in main.tf differ from azurerm_resource_group.main /
+# If your resource labels in main.tf differ from azurerm_resource_group.rg /
 # azurerm_kubernetes_cluster.aks, update the references below to match.
 
 resource "azurerm_log_analytics_workspace" "monitoring" {
@@ -34,12 +34,12 @@ resource "azurerm_monitor_diagnostic_setting" "aks_diagnostics" {
     category = "kube-controller-manager"
   }
 
-  metric {
+  enabled_metric {
     category = "AllMetrics"
   }
 }
 
-resource "kubernetes_namespace" "monitoring" {
+resource "kubernetes_namespace_v1" "monitoring" {
   metadata {
     name = "monitoring"
   }
