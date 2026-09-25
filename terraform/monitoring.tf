@@ -1,14 +1,14 @@
 # monitoring.tf
 # Infrastructure-as-Code addition for Task 10.2D.
 # Provisions a Log Analytics workspace and enables Container Insights on the
-# existing AKS cluster (referenced from your Week08 main.tf), plus the
-# Kubernetes namespace that the Prometheus/Grafana Helm release deploys into.
+# existing AKS cluster. Prometheus and Grafana Kubernetes resources are
+# deployed later by Helm and kubectl after AKS exists.
 #
 # Assumes your existing Terraform config already defines:
 #   - azurerm_resource_group.rg          (dar-week08-v1-rg / Australia East)
 #   - azurerm_kubernetes_cluster.aks
 #   - variable "tags" (as set in your terraform.tfvars)
-#   - a configured azurerm and kubernetes provider
+#   - a configured azurerm provider
 # If your resource labels in main.tf differ from azurerm_resource_group.rg /
 # azurerm_kubernetes_cluster.aks, update the references below to match.
 
@@ -36,12 +36,6 @@ resource "azurerm_monitor_diagnostic_setting" "aks_diagnostics" {
 
   enabled_metric {
     category = "AllMetrics"
-  }
-}
-
-resource "kubernetes_namespace_v1" "monitoring" {
-  metadata {
-    name = "monitoring"
   }
 }
 
