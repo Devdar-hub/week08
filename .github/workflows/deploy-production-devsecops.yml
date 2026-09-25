@@ -1,13 +1,5 @@
 name: Deploy to Production (Terraform + Security + Monitoring)
 
-# Extends the Week08 CI/CD pipeline with:
-#   1. Terraform  - automated infrastructure provisioning (before build/deploy)
-#   2. Docker Scout - container vulnerability scanning (after build, before push/deploy)
-#   3. Prometheus/Grafana - monitoring deployment + validation (after app deploy)
-#
-# Trigger: manual dispatch with the staging-validated commit SHA, matching the
-# existing production promotion pattern used in this project.
-
 on:
   push:
     branches:
@@ -16,21 +8,15 @@ on:
 env:
   IMAGE_SHA: ${{ github.event.inputs.image_sha || github.sha }}
   TF_WORKING_DIR: terraform
-  SERVICES: "user-service student-service lecturer-service course-service enrollment-service frontend"
+  ACR_LOGIN_SERVER: ${{ vars.ACR_NAME }}.azurecr.io
+  STORAGE_ACCOUNT_NAME: ${{ vars.STORAGE_ACCOUNT_NAME || 'sgdar81v1' }}
+  AKS_DNS_PREFIX: ${{ vars.AKS_DNS_PREFIX || 'dar-dns-v1' }}
 
 jobs:
-  # ------------------------------------------------------------------
-  # 1. INFRASTRUCTURE AS CODE
-  #    Runs first: any infra drift or new resources (e.g. a monitoring
-  #    namespace, a new Log Analytics workspace) must exist before the
-  #    app is deployed or monitoring is installed.
-  # ------------------------------------------------------------------
   terraform:
     name: Terraform Plan & Apply
     runs-on: ubuntu-latest
     environment: production
-    outputs:
-      plan_exitcode: ${{ steps.plan.outputs.exitcode }}
     env:
       TF_VAR_resource_group_name: ${{ vars.AKS_RESOURCE_GROUP }}
       TF_VAR_acr_name: ${{ vars.ACR_NAME }}
@@ -39,7 +25,7 @@ jobs:
       TF_VAR_aks_dns_prefix: ${{ vars.AKS_DNS_PREFIX || 'dar-dns-v1' }}
       TF_VAR_aks_node_count: 3
       TF_VAR_aks_node_vm_size: Standard_D2s_v3
-      TF_VAR_environment: production  
+      TF_VAR_environment: production
     defaults:
       run:
         working-directory: ${{ env.TF_WORKING_DIR }}
@@ -59,45 +45,46 @@ jobs:
 
       - name: Terraform Init
         run: terraform init -input=false
-        env:
-          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
-          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
-          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
-          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
 
       - name: Terraform Validate
         run: terraform validate
 
-      - name: Import existing AKS diagnostic setting
+      - name: Import existing Azure resources if present
         run: |
-          AKS_ID=$(az aks show \
-            --resource-group ${{ vars.AKS_RESOURCE_GROUP }} \
-            --name ${{ vars.AKS_CLUSTER_NAME }} \
-            --query id \
-            -o tsv 2>/dev/null || true)
+          set +e
 
-          if [ -n "$AKS_ID" ]; then
-            terraform import \
-              azurerm_monitor_diagnostic_setting.aks_diagnostics \
-              "$AKS_ID|aks-diagnostics" \
-              || true
+          RG_ID=$(az group show --name "${{ vars.AKS_RESOURCE_GROUP }}" --query id -o tsv 2>/dev/null)
+          if [ -n "$RG_ID" ]; then
+            terraform import azurerm_resource_group.rg "$RG_ID" || true
           fi
-        env:
-          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
-          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
-          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
-          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+
+          ACR_ID=$(az acr show --name "${{ vars.ACR_NAME }}" --resource-group "${{ vars.AKS_RESOURCE_GROUP }}" --query id -o tsv 2>/dev/null)
+          if [ -n "$ACR_ID" ]; then
+            terraform import azurerm_container_registry.acr "$ACR_ID" || true
+          fi
+
+          STORAGE_ID=$(az storage account show --name "${{ env.STORAGE_ACCOUNT_NAME }}" --resource-group "${{ vars.AKS_RESOURCE_GROUP }}" --query id -o tsv 2>/dev/null)
+          if [ -n "$STORAGE_ID" ]; then
+            terraform import azurerm_storage_account.storage_account "$STORAGE_ID" || true
+          fi
+
+          AKS_ID=$(az aks show --resource-group "${{ vars.AKS_RESOURCE_GROUP }}" --name "${{ vars.AKS_CLUSTER_NAME }}" --query id -o tsv 2>/dev/null)
+          if [ -n "$AKS_ID" ]; then
+            terraform import azurerm_kubernetes_cluster.aks "$AKS_ID" || true
+            terraform import azurerm_monitor_diagnostic_setting.aks_diagnostics "$AKS_ID|aks-diagnostics" || true
+          fi
+
+          LAW_ID=$(az monitor log-analytics workspace show --resource-group "${{ vars.AKS_RESOURCE_GROUP }}" --workspace-name "dar81v1-law" --query id -o tsv 2>/dev/null)
+          if [ -n "$LAW_ID" ]; then
+            terraform import azurerm_log_analytics_workspace.monitoring "$LAW_ID" || true
+          fi
+
+          set -e
 
       - name: Terraform Plan
-        id: plan
         run: terraform plan -input=false -no-color -out=tfplan
-        env:
-          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
-          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
-          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
-          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
 
-      - name: Upload plan as evidence
+      - name: Upload Terraform plan as evidence
         uses: actions/upload-artifact@v4
         with:
           name: terraform-plan-output
@@ -105,22 +92,27 @@ jobs:
 
       - name: Terraform Apply
         run: terraform apply -input=false -auto-approve tfplan
-        env:
-          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
-          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
-          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
-          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
 
-  # ------------------------------------------------------------------
-  # 2. BUILD IMAGES
-  # ------------------------------------------------------------------
-  build:
-    name: Build & Push Images
+  build-scan-push:
+    name: Build, Docker Scout Scan & Push ${{ matrix.service }}
     needs: terraform
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        service: [user-service, student-service, lecturer-service, course-service, enrollment-service, frontend]
+        include:
+          - service: frontend
+            image: koalatech-frontend
+          - service: user-service
+            image: koalatech-user-service
+          - service: student-service
+            image: koalatech-student-service
+          - service: lecturer-service
+            image: koalatech-lecturer-service
+          - service: course-service
+            image: koalatech-course-service
+          - service: enrollment-service
+            image: koalatech-enrollment-service
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -132,110 +124,161 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: ACR login
+      - name: Login to Azure Container Registry
         run: az acr login --name ${{ vars.ACR_NAME }}
 
-      - name: Build image
+      - name: Build Docker image
         run: |
-          docker build -t ${{ vars.ACR_NAME }}.azurecr.io/${{ matrix.service }}:${{ env.IMAGE_SHA }} \
+          docker build \
+            --platform linux/amd64 \
+            -t ${{ env.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ env.IMAGE_SHA }} \
             ./${{ matrix.service }}
 
-      # --------------------------------------------------------------
-      # 3. SECURITY SCANNING - Docker Scout
-      #    Placed immediately after build and BEFORE push/deploy, so a
-      #    critical/high vulnerability can block promotion before the
-      #    image ever reaches the cluster.
-      # --------------------------------------------------------------
       - name: Docker Scout - CVE scan
-        id: scout-cves
         uses: docker/scout-action@v1
         with:
+          dockerhub-user: ${{ secrets.DOCKER_USER }}
+          dockerhub-password: ${{ secrets.DOCKER_PAT }}
           command: cves
-          image: ${{ vars.ACR_NAME }}.azurecr.io/${{ matrix.service }}:${{ env.IMAGE_SHA }}
+          image: local://${{ env.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ env.IMAGE_SHA }}
           only-severities: critical,high
-          exit-code: false           # set true once you've remediated known issues, to enforce the gate
+          exit-code: false
           write-comment: false
           summary: true
 
       - name: Docker Scout - recommendations
         uses: docker/scout-action@v1
         with:
+          dockerhub-user: ${{ secrets.DOCKER_USER }}
+          dockerhub-password: ${{ secrets.DOCKER_PAT }}
           command: recommendations
-          image: ${{ vars.ACR_NAME }}.azurecr.io/${{ matrix.service }}:${{ env.IMAGE_SHA }}
+          image: local://${{ env.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ env.IMAGE_SHA }}
           summary: true
 
-      - name: Save Docker Scout report as evidence
+      - name: Save Docker Scout evidence note
         run: |
           mkdir -p scout-reports
-          echo "Scout scan for ${{ matrix.service }} completed - see job summary for full CVE/recommendation output" \
-            > scout-reports/${{ matrix.service }}-scout-summary.txt
+          echo "Docker Scout scanned ${{ env.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ env.IMAGE_SHA }}. See the job summary and step logs for CVE and recommendation details." > scout-reports/${{ matrix.service }}.txt
 
-      - name: Upload Docker Scout evidence
+      - name: Upload Docker Scout evidence note
         uses: actions/upload-artifact@v4
         with:
           name: docker-scout-${{ matrix.service }}
-          path: scout-reports/
+          path: scout-reports/${{ matrix.service }}.txt
 
-      - name: Push image (post security gate)
-        run: docker push ${{ vars.ACR_NAME }}.azurecr.io/${{ matrix.service }}:${{ env.IMAGE_SHA }}
+      - name: Push Docker image
+        run: docker push ${{ env.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ env.IMAGE_SHA }}
 
-  # ------------------------------------------------------------------
-  # 4. APPLICATION DEPLOYMENT (existing step, kept as-is)
-  # ------------------------------------------------------------------
-  deploy:
-    name: Deploy to AKS
-    needs: build
+  deploy-production:
+    name: Deploy Application to Production
+    needs: build-scan-push
     runs-on: ubuntu-latest
     environment: production
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.IMAGE_SHA }}
 
       - name: Azure login
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Set AKS context
-        uses: azure/aks-set-context@v4
-        with:
-          resource-group: ${{ vars.AKS_RESOURCE_GROUP }}
-
-          cluster-name: ${{ vars.AKS_CLUSTER_NAME }}
-
-      - name: Deploy manifests
+      - name: Get AKS credentials
         run: |
-          for svc in ${{ env.SERVICES }}; do
-            kubectl set image deployment/$svc $svc=${{ vars.ACR_NAME }}.azurecr.io/$svc:${{ env.IMAGE_SHA }}
-          done
-          kubectl rollout status deployment/user-service
-          kubectl rollout status deployment/frontend
+          az aks get-credentials \
+            --resource-group ${{ vars.AKS_RESOURCE_GROUP }} \
+            --name ${{ vars.AKS_CLUSTER_NAME }} \
+            --overwrite-existing
 
-  # ------------------------------------------------------------------
-  # 5. MONITORING AND OBSERVABILITY - Prometheus + Grafana
-  #    Runs after deploy so it can immediately validate metrics are
-  #    flowing from the just-deployed application and cluster.
-  # ------------------------------------------------------------------
+      - name: Resolve storage connection string
+        run: |
+          STORAGE_CONNECTION_STRING=$(az storage account show-connection-string \
+            --resource-group ${{ vars.AKS_RESOURCE_GROUP }} \
+            --name ${{ env.STORAGE_ACCOUNT_NAME }} \
+            --query connectionString \
+            -o tsv)
+          echo "STORAGE_CONNECTION_STRING=$STORAGE_CONNECTION_STRING" >> "$GITHUB_ENV"
+
+      - name: Create production namespace
+        run: |
+          kubectl create namespace production \
+            --dry-run=client \
+            -o yaml | kubectl apply -f -
+
+      - name: Create PostgreSQL secret
+        run: |
+          kubectl create secret generic postgres-secret \
+            --namespace production \
+            --from-literal=POSTGRES_USER="${{ secrets.POSTGRES_USER }}" \
+            --from-literal=POSTGRES_PASSWORD="${{ secrets.POSTGRES_PASSWORD }}" \
+            --dry-run=client \
+            -o yaml | kubectl apply -f -
+
+      - name: Create application secret
+        run: |
+          kubectl create secret generic application-secret \
+            --namespace production \
+            --from-literal=POSTGRES_USER="${{ secrets.POSTGRES_USER }}" \
+            --from-literal=POSTGRES_PASSWORD="${{ secrets.POSTGRES_PASSWORD }}" \
+            --from-literal=JWT_SECRET_KEY="${{ secrets.JWT_SECRET_KEY }}" \
+            --from-literal=DEFAULT_ADMIN_USERNAME="${{ secrets.DEFAULT_ADMIN_USERNAME }}" \
+            --from-literal=DEFAULT_ADMIN_EMAIL="${{ secrets.DEFAULT_ADMIN_EMAIL }}" \
+            --from-literal=DEFAULT_ADMIN_PASSWORD="${{ secrets.DEFAULT_ADMIN_PASSWORD }}" \
+            --from-literal=AZURE_STORAGE_CONNECTION_STRING="$STORAGE_CONNECTION_STRING" \
+            --dry-run=client \
+            -o yaml | kubectl apply -f -
+
+      - name: Apply production manifests
+        run: kubectl apply -f kubernetes/production/
+
+      - name: Update deployment images
+        run: |
+          kubectl set image deployment/frontend frontend=${{ env.ACR_LOGIN_SERVER }}/koalatech-frontend:${{ env.IMAGE_SHA }} -n production
+          kubectl set image deployment/user-service user-service=${{ env.ACR_LOGIN_SERVER }}/koalatech-user-service:${{ env.IMAGE_SHA }} -n production
+          kubectl set image deployment/student-service student-service=${{ env.ACR_LOGIN_SERVER }}/koalatech-student-service:${{ env.IMAGE_SHA }} -n production
+          kubectl set image deployment/lecturer-service lecturer-service=${{ env.ACR_LOGIN_SERVER }}/koalatech-lecturer-service:${{ env.IMAGE_SHA }} -n production
+          kubectl set image deployment/course-service course-service=${{ env.ACR_LOGIN_SERVER }}/koalatech-course-service:${{ env.IMAGE_SHA }} -n production
+          kubectl set image deployment/enrollment-service enrollment-service=${{ env.ACR_LOGIN_SERVER }}/koalatech-enrollment-service:${{ env.IMAGE_SHA }} -n production
+
+      - name: Wait for production rollouts
+        run: |
+          kubectl rollout status deployment/frontend -n production --timeout=300s
+          kubectl rollout status deployment/user-service -n production --timeout=300s
+          kubectl rollout status deployment/student-service -n production --timeout=300s
+          kubectl rollout status deployment/lecturer-service -n production --timeout=300s
+          kubectl rollout status deployment/course-service -n production --timeout=300s
+          kubectl rollout status deployment/enrollment-service -n production --timeout=300s
+
+      - name: Show production resources
+        run: |
+          kubectl get pods -n production
+          kubectl get services -n production
+          kubectl get pvc -n production
+
   monitoring:
     name: Deploy & Validate Monitoring
-    needs: deploy
+    needs: deploy-production
     runs-on: ubuntu-latest
     environment: production
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.IMAGE_SHA }}
 
       - name: Azure login
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Set AKS context
-        uses: azure/aks-set-context@v4
-        with:
-          resource-group: ${{ vars.AKS_RESOURCE_GROUP }}
-
-          cluster-name: ${{ vars.AKS_CLUSTER_NAME }}
+      - name: Get AKS credentials
+        run: |
+          az aks get-credentials \
+            --resource-group ${{ vars.AKS_RESOURCE_GROUP }} \
+            --name ${{ vars.AKS_CLUSTER_NAME }} \
+            --overwrite-existing
 
       - name: Install Helm
         uses: azure/setup-helm@v4
@@ -254,24 +297,18 @@ jobs:
             -f monitoring/values.yaml \
             --wait --timeout 10m
 
-      - name: Apply custom ServiceMonitors and dashboard
+      - name: Apply custom ServiceMonitor and dashboard
         run: |
           kubectl apply -f monitoring/service-monitor.yaml -n monitoring
           kubectl apply -f monitoring/grafana-dashboard-configmap.yaml -n monitoring
 
-      - name: Validate Prometheus is collecting metrics
+      - name: Validate Prometheus and Grafana
         run: |
-          kubectl rollout status deployment/monitoring-kube-prometheus-operator -n monitoring
           kubectl get pods -n monitoring
-          kubectl exec -n monitoring deploy/monitoring-kube-prometheus-operator -- true || true
-          echo "Prometheus targets check:"
+          kubectl rollout status deployment/monitoring-grafana -n monitoring --timeout=300s
           kubectl port-forward -n monitoring svc/monitoring-kube-prometheus-prometheus 9090:9090 &
           sleep 8
           curl -s http://localhost:9090/-/ready && echo "Prometheus is ready"
-
-      - name: Validate Grafana is reachable
-        run: |
-          kubectl rollout status deployment/monitoring-grafana -n monitoring
           kubectl port-forward -n monitoring svc/monitoring-grafana 3000:80 &
           sleep 8
           curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/login | grep -q "200" && echo "Grafana is reachable"
